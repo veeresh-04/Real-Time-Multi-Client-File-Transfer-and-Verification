@@ -33,3 +33,4 @@ server_storage/
 *.log
 *.tmp
 *.temp
+stress_tmp/

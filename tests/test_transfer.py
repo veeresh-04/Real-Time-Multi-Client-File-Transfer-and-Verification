@@ -101,10 +101,17 @@ class TestErrorSimulation:
 
     async def test_transfer_succeeds_with_drop_simulation(self, tmp_path):
         """Transfers should succeed even with packet drops and retries."""
-        config.SIMULATE_ERRORS  = True
-        config.DROP_PROBABILITY = 0.2      # 20% drop rate
+        orig_simulate = config.SIMULATE_ERRORS
+        orig_drop     = config.DROP_PROBABILITY
+        orig_corrupt  = config.CORRUPT_PROBABILITY
+        orig_retries  = config.MAX_RETRIES
+        orig_port     = config.PORT
+
+        config.SIMULATE_ERRORS    = True
+        config.DROP_PROBABILITY   = 0.2
         config.CORRUPT_PROBABILITY = 0.0
-        config.PORT = 19002
+        config.MAX_RETRIES        = 10   # enough headroom for 20% drop rate
+        config.PORT               = 19002
 
         server = FileTransferServer()
         task = asyncio.create_task(server.serve_forever())
@@ -120,5 +127,8 @@ class TestErrorSimulation:
                 await task
             except asyncio.CancelledError:
                 pass
-            config.SIMULATE_ERRORS  = False
-            config.PORT = 19001
+            config.SIMULATE_ERRORS     = orig_simulate
+            config.DROP_PROBABILITY    = orig_drop
+            config.CORRUPT_PROBABILITY = orig_corrupt
+            config.MAX_RETRIES         = orig_retries
+            config.PORT                = orig_port

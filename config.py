@@ -15,7 +15,7 @@ HEADER_SIZE: int = 17              # struct.calcsize(HEADER_FORMAT) — pre-comp
 
 # --- Reliability ---
 MAX_RETRIES: int = 5               # How many times a client retries a failed chunk
-RETRY_TIMEOUT: float = 2.0        # Seconds to wait for an ACK before retrying
+RETRY_TIMEOUT: float = 0.5        # Seconds to wait for ACK before retrying (low = fast recovery under load)
 SOCKET_TIMEOUT: float = 5.0       # General socket read timeout
 
 # --- Concurrency ---

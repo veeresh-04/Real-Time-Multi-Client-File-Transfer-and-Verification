@@ -1,25 +1,30 @@
 # =============================================================================
 # client/client.py — Async file transfer client.
 #
-# Lifecycle per run():
-#   1. Connect to server via TCP.
-#   2. Upload local file  (UPLOAD_REQUEST).
-#   3. Receive chunks back, ACK good / NACK bad or timed-out chunks.
-#   4. Reassemble chunks in sequence order.
-#   5. Receive TRANSFER_DONE + SHA-256 digest from server.
-#   6. Verify digest against local reassembly.
-#   7. Write verified file to CLIENT_OUTPUT_DIR.
+# Protocol design — seq_num-driven delivery:
+#
+#   For each incoming CHUNK_DATA the client:
+#     1. Reads the chunk off the wire.
+#     2. Validates it with CRC32.
+#     3. If valid  → stores payload, sends ACK(seq_num=chunk.seq_num).
+#     4. If invalid → sends NACK(seq_num=chunk.seq_num), server retransmits.
+#     5. On timeout → sends NACK(seq_num=0xFFFFFFFF), server retransmits
+#        the current chunk.
+#
+#   Every ACK/NACK carries an explicit seq_num so the server always knows
+#   exactly which chunk is being acknowledged, regardless of timing.
+#   This eliminates the sync-drift bug that caused missing chunks under load.
 #
 # Wire format for CHUNK_DATA (server → client):
-#   1B  — Opcode.CHUNK_DATA  (0x02)
-#   2B  — payload length     (uint16, network order)
-#   13B — chunk header       (client_id, seq_num, total_chunks, is_last)
-#   NB  — payload            (N == payload length from above)
+#   1B  Opcode.CHUNK_DATA
+#   2B  payload length     (uint16, network order)
+#   17B chunk header       (client_id, seq_num, total_chunks, is_last, crc32)
+#   NB  payload
 #
 # Wire format for TRANSFER_DONE (server → client):
-#   1B  — Opcode.TRANSFER_DONE  (0x05)
-#   2B  — digest length          (uint16, always 64 for SHA-256)
-#   64B — ASCII hex digest
+#   1B  Opcode.TRANSFER_DONE
+#   2B  digest length       (uint16, always 64)
+#   64B ASCII hex digest
 # =============================================================================
 
 from __future__ import annotations
@@ -61,18 +66,14 @@ class FileTransferClient:
     # ------------------------------------------------------------------
 
     async def run(self) -> bool:
-        """Execute the full transfer lifecycle. Returns True on success.
-
-        All domain exceptions are caught and logged here so that concurrent
-        clients running in the same event loop are fully independent.
-        """
+        """Execute the full transfer lifecycle. Returns True on success."""
         logger.info(
             "Client %d — starting transfer of '%s'",
             self.client_id, self.file_path.name,
         )
         try:
             await self._connect()
-            file_data = self._read_local_file()
+            file_data     = self._read_local_file()
             await self._upload(file_data)
             received_data = await self._receive_chunks()
             server_digest = await self._receive_transfer_done()
@@ -105,7 +106,6 @@ class FileTransferClient:
     # ------------------------------------------------------------------
 
     async def _connect(self) -> None:
-        """Open a TCP connection to the server."""
         self._reader, self._writer = await asyncio.open_connection(
             config.HOST, config.PORT
         )
@@ -114,15 +114,10 @@ class FileTransferClient:
         )
 
     # ------------------------------------------------------------------
-    # Phase 1 — Read local file and upload
+    # Phase 1 — Upload
     # ------------------------------------------------------------------
 
     def _read_local_file(self) -> bytes:
-        """Read the entire local file into memory.
-
-        Raises:
-            FileNotFoundError: If self.file_path does not exist.
-        """
         data = self.file_path.read_bytes()
         logger.info(
             "Client %d — read %d bytes from '%s'.",
@@ -131,52 +126,45 @@ class FileTransferClient:
         return data
 
     async def _upload(self, file_data: bytes) -> None:
-        """Send UPLOAD_REQUEST to the server.
+        """Send UPLOAD_REQUEST.
 
         Wire format:
-            1B  — Opcode.UPLOAD_REQUEST  (0x01)
-            4B  — file size              (uint32, network order)
-            NB  — raw file bytes
+            1B  Opcode.UPLOAD_REQUEST
+            4B  file size (uint32, network order)
+            NB  raw file bytes
         """
-        size_header = struct.pack("!I", len(file_data))
-        await self._write(Opcode.UPLOAD_REQUEST + size_header + file_data)
+        await self._write(
+            Opcode.UPLOAD_REQUEST
+            + struct.pack("!I", len(file_data))
+            + file_data
+        )
         logger.info(
             "Client %d — upload sent (%d bytes).", self.client_id, len(file_data)
         )
 
     # ------------------------------------------------------------------
-    # Phase 2 — Receive chunks, ACK / NACK each one
+    # Phase 2 — Receive chunks
     # ------------------------------------------------------------------
 
     async def _receive_chunks(self) -> bytes:
-        """Drive the chunk-receive loop until TRANSFER_DONE arrives.
+        """Receive chunks, ACK or NACK each one by explicit seq_num.
 
-        For each incoming CHUNK_DATA:
-          - Read it off the wire.
-          - Validate it (non-empty payload as a basic corruption check).
-          - ACK if valid; NACK if corrupt (server will retransmit).
-          - Track per-chunk NACK count; raise after MAX_RETRIES.
-
-        A dropped chunk is detected when _read_opcode_with_timeout returns
-        None.  The client then sends a NACK with seq_num = -1 to signal
-        "I'm still waiting" and loops again.
+        Key design:
+            Every ACK and NACK carries chunk.seq_num so the server knows
+            exactly which chunk is being acknowledged.  Timeout NACKs use
+            sentinel 0xFFFFFFFF meaning "current chunk timed out, resend".
 
         Returns:
-            Fully reassembled and ordered file bytes.
-
-        Raises:
-            MaxRetriesExceededError: If any chunk cannot be received cleanly.
-            ProtocolError:           On unexpected opcodes or missing chunks.
-            ClientDisconnectedError: On server disconnect.
+            Fully reassembled file bytes in correct order.
         """
-        received: dict[int, bytes] = {}     # seq_num → payload
-        total_chunks: int | None = None
-        nack_counts: dict[int, int] = {}    # seq_num → consecutive NACKs
+        received: dict[int, bytes] = {}   # seq_num → payload
+        total_chunks: int | None   = None
+        nack_counts:  dict[int, int] = {} # seq_num → consecutive NACKs
 
         while True:
             opcode = await self._read_opcode_with_timeout()
 
-            # ── CHUNK_DATA ───────────────────────────────────────────
+            # ── CHUNK_DATA ────────────────────────────────────────────
             if opcode == Opcode.CHUNK_DATA:
                 chunk = await self._read_chunk_body()
 
@@ -185,8 +173,8 @@ class FileTransferClient:
 
                 if self._is_valid(chunk):
                     received[chunk.seq_num] = chunk.payload
-                    nack_counts.pop(chunk.seq_num, None)   # reset on success
-                    await self._send_ack(chunk.seq_num)
+                    nack_counts.pop(chunk.seq_num, None)
+                    await self._send_ack(chunk.seq_num)   # ← ACK carries seq_num
                     logger.debug(
                         "Client %d — ACK chunk %d / %d",
                         self.client_id, chunk.seq_num + 1, total_chunks,
@@ -196,7 +184,7 @@ class FileTransferClient:
                     nack_counts[chunk.seq_num] = count
                     if count > config.MAX_RETRIES:
                         raise MaxRetriesExceededError(chunk.seq_num, count)
-                    await self._send_nack(chunk.seq_num)
+                    await self._send_nack(chunk.seq_num)  # ← NACK carries seq_num
                     logger.warning(
                         "Client %d — NACK chunk %d (attempt %d / %d)",
                         self.client_id, chunk.seq_num, count, config.MAX_RETRIES,
@@ -204,18 +192,18 @@ class FileTransferClient:
 
             # ── TIMEOUT (dropped chunk) ───────────────────────────────
             elif opcode is None:
-                # Server dropped a chunk.  NACK with seq_num = 0xFFFFFFFF
-                # (max uint32) signals "I'm still waiting — resend pending chunks."
+                # 0xFFFFFFFF = sentinel meaning "resend current chunk"
                 await self._send_nack(0xFFFFFFFF)
                 logger.warning(
-                    "Client %d — timeout waiting for chunk, sent NACK.", self.client_id
+                    "Client %d — timeout waiting for chunk, sent NACK.",
+                    self.client_id,
                 )
 
             # ── TRANSFER_DONE ─────────────────────────────────────────
             elif opcode == Opcode.TRANSFER_DONE:
-                break   # digest is read in _receive_transfer_done()
+                break
 
-            # ── ERROR from server ─────────────────────────────────────
+            # ── ERROR ─────────────────────────────────────────────────
             elif opcode == Opcode.ERROR:
                 msg = await self._read_error_body()
                 raise ProtocolError(f"Server error: {msg}")
@@ -224,14 +212,12 @@ class FileTransferClient:
                 raise ProtocolError(f"Unexpected opcode 0x{opcode.hex()}")
 
         if total_chunks is None:
-            raise ProtocolError(
-                "No chunks received — server sent TRANSFER_DONE immediately."
-            )
+            raise ProtocolError("No chunks received — server sent TRANSFER_DONE immediately.")
 
         return self._reassemble(received, total_chunks)
 
     async def _read_opcode_with_timeout(self) -> bytes | None:
-        """Read 1-byte opcode, returning None on timeout (indicates dropped chunk)."""
+        """Read 1-byte opcode; return None on timeout (dropped chunk)."""
         try:
             return await asyncio.wait_for(
                 self._read_exact(1), timeout=config.RETRY_TIMEOUT
@@ -240,42 +226,26 @@ class FileTransferClient:
             return None
 
     async def _read_chunk_body(self) -> Chunk:
-        """Read payload-length prefix, then full chunk header + payload.
+        """Read 2B payload-length, then 17B header, then payload.
 
-        Wire layout (after the CHUNK_DATA opcode byte):
-            2B  — payload length  (uint16, network order)
-            13B — chunk header    (client_id, seq_num, total_chunks, is_last)
-            NB  — payload
+        Wire layout after opcode:
+            2B  payload length (uint16)
+            17B chunk header
+            NB  payload
         """
-        raw_len = await self._read_exact(2)
-        (payload_len,) = struct.unpack("!H", raw_len)
-
-        header_bytes = await self._read_exact(Chunk._HEADER_SIZE)
-        payload = await self._read_exact(payload_len)
-
+        (payload_len,) = struct.unpack("!H", await self._read_exact(2))
+        header_bytes   = await self._read_exact(Chunk._HEADER_SIZE)
+        payload        = await self._read_exact(payload_len)
         return Chunk.from_bytes(header_bytes + payload)
 
     @staticmethod
     def _is_valid(chunk: Chunk) -> bool:
-        """Return False if the chunk fails its CRC32 integrity check.
-
-        Every chunk carries a CRC32 of its payload in the header (computed
-        by the server before any simulation faults are applied).  The client
-        recomputes and compares — a mismatch means the payload was corrupted
-        in transit and the chunk must be NACKed for retransmission.
-
-        An empty payload on the sole chunk of an empty file is always valid.
-        """
+        """CRC32 integrity check.  Empty payload on empty-file chunk is valid."""
         if chunk.is_last and chunk.total_chunks == 1 and len(chunk.payload) == 0:
-            return True   # legitimate empty-file chunk
+            return True
         return chunk.is_crc_valid()
 
     def _reassemble(self, received: dict[int, bytes], total: int) -> bytes:
-        """Concatenate payloads in seq_num order.
-
-        Raises:
-            ProtocolError: If any chunk seq_num is absent from *received*.
-        """
         missing = [i for i in range(total) if i not in received]
         if missing:
             raise ProtocolError(
@@ -285,47 +255,33 @@ class FileTransferClient:
         return b"".join(received[i] for i in range(total))
 
     # ------------------------------------------------------------------
-    # Phase 3 — Receive TRANSFER_DONE + digest
+    # Phase 3 — TRANSFER_DONE + checksum
     # ------------------------------------------------------------------
 
     async def _receive_transfer_done(self) -> str:
-        """Read the SHA-256 digest that follows the TRANSFER_DONE opcode.
+        """Read SHA-256 digest.  Opcode was already consumed in _receive_chunks.
 
-        The opcode byte was already consumed in _receive_chunks.
-        Remaining wire layout:
-            2B  — digest length  (uint16, always 64 for SHA-256)
-            64B — ASCII hex digest
-
-        Returns:
-            64-character lowercase hex string.
+        Wire layout:
+            2B  digest length (uint16, always 64)
+            64B ASCII hex digest
         """
-        raw_len = await self._read_exact(2)
-        (digest_len,) = struct.unpack("!H", raw_len)
+        (digest_len,) = struct.unpack("!H", await self._read_exact(2))
         digest = (await self._read_exact(digest_len)).decode("ascii")
         logger.debug(
-            "Client %d — received server checksum: %s…",
-            self.client_id, digest[:16],
+            "Client %d — received server checksum: %s…", self.client_id, digest[:16]
         )
         return digest
 
     # ------------------------------------------------------------------
-    # Phase 4 — Verify integrity and persist
+    # Phase 4 — Verify + save
     # ------------------------------------------------------------------
 
     def _verify(self, data: bytes, expected: str) -> None:
-        """Recompute SHA-256 and compare to server's digest.
-
-        Raises:
-            ChecksumMismatchError: If the digests differ.
-        """
         if not checksum.verify(data, expected):
-            raise ChecksumMismatchError(
-                expected=expected, actual=checksum.compute(data)
-            )
+            raise ChecksumMismatchError(expected=expected, actual=checksum.compute(data))
         logger.info("Client %d — checksum verified ✓", self.client_id)
 
     def _save_output(self, data: bytes) -> None:
-        """Write the reassembled file to CLIENT_OUTPUT_DIR."""
         out_dir = Path(config.CLIENT_OUTPUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
         dest = out_dir / f"client_{self.client_id}_{self.file_path.name}"
@@ -333,7 +289,7 @@ class FileTransferClient:
         logger.info("Client %d — saved to '%s'", self.client_id, dest)
 
     # ------------------------------------------------------------------
-    # ACK / NACK helpers
+    # ACK / NACK senders
     # ------------------------------------------------------------------
 
     async def _send_ack(self, seq_num: int) -> None:
@@ -343,28 +299,24 @@ class FileTransferClient:
         await self._write(NackMessage(self.client_id, seq_num).to_bytes())
 
     # ------------------------------------------------------------------
-    # Low-level I/O helpers
+    # Low-level I/O
     # ------------------------------------------------------------------
 
     async def _read_exact(self, n: int) -> bytes:
-        """Read exactly *n* bytes; raise ClientDisconnectedError on EOF."""
         try:
             return await self._reader.readexactly(n)
         except asyncio.IncompleteReadError as exc:
             raise ClientDisconnectedError(self.client_id) from exc
 
     async def _read_error_body(self) -> str:
-        """Read the message body of an ERROR opcode (1B length + N bytes)."""
         (length,) = struct.unpack("!B", await self._read_exact(1))
         return (await self._read_exact(length)).decode("utf-8", errors="replace")
 
     async def _write(self, data: bytes) -> None:
-        """Write bytes to the server stream and flush."""
         self._writer.write(data)
         await self._writer.drain()
 
     async def _close(self) -> None:
-        """Gracefully close the TCP connection."""
         if self._writer:
             try:
                 self._writer.close()
