@@ -1,6 +1,6 @@
 # Multi-Client File Transfer System
 
-A production-grade, async multi-client file transfer system built in Python using **AsyncIO** and **TCP sockets**. The server handles concurrent client sessions independently, splits files into chunks, verifies integrity with SHA-256 checksums and per-chunk CRC32, and implements full retransmission logic for simulated network faults.
+A multi-client file transfer system built in Python using AsyncIO and TCP sockets. Multiple clients can upload files to the server concurrently. The server splits files into chunks, sends them back, and verifies integrity using SHA-256 checksums and per-chunk CRC32. Network faults like dropped and corrupted packets are simulated, with full retransmission logic to recover from them.
 
 ---
 
