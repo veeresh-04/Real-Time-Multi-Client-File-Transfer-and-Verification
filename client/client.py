@@ -17,7 +17,7 @@
 #
 # Wire format for CHUNK_DATA (server → client):
 #   1B  Opcode.CHUNK_DATA
-#   2B  payload length     (uint16, network order)
+#   4B  payload length  (uint32), network order)
 #   17B chunk header       (client_id, seq_num, total_chunks, is_last, crc32)
 #   NB  payload
 #
@@ -229,11 +229,11 @@ class FileTransferClient:
         """Read 2B payload-length, then 17B header, then payload.
 
         Wire layout after opcode:
-            2B  payload length (uint16)
+            4B  payload length  (uint32))
             17B chunk header
             NB  payload
         """
-        (payload_len,) = struct.unpack("!H", await self._read_exact(2))
+        (payload_len,) = struct.unpack("!I", await self._read_exact(4))
         header_bytes   = await self._read_exact(Chunk._HEADER_SIZE)
         payload        = await self._read_exact(payload_len)
         return Chunk.from_bytes(header_bytes + payload)

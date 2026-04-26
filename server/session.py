@@ -18,7 +18,7 @@
 #
 # Wire format per chunk (server → client):
 #   1B  Opcode.CHUNK_DATA
-#   2B  payload length  (uint16, network order)
+#   4B  payload length  (uint32, network order))
 #   17B chunk header    (client_id, seq_num, total_chunks, is_last, crc32)
 #   NB  payload
 # =============================================================================
@@ -206,7 +206,7 @@ class ClientSession:
             payload_len = len(chunk.payload)
 
         await self._write(
-            Opcode.CHUNK_DATA + struct.pack("!H", payload_len) + wire
+            Opcode.CHUNK_DATA + struct.pack("!I", payload_len) + wire
         )
 
     # ------------------------------------------------------------------

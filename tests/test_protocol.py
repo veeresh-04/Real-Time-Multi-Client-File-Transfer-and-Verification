@@ -7,6 +7,7 @@ import pytest
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+import config
 from core.protocol import (
     Chunk, AckMessage, NackMessage, Opcode,
     split_file_into_chunks, recv_exact,
@@ -53,14 +54,14 @@ class TestChunkSerialization:
 class TestSplitFileIntoChunks:
 
     def test_exact_multiple_of_chunk_size(self):
-        data = b"X" * 2048           # exactly 2 × 1024
+        data = b"X" * (config.CHUNK_SIZE * 2)   # exactly 2 chunks
         chunks = split_file_into_chunks(data, client_id=1)
         assert len(chunks) == 2
         assert chunks[-1].is_last is True
         assert all(not c.is_last for c in chunks[:-1])
 
     def test_non_multiple_creates_partial_last_chunk(self):
-        data = b"A" * 1500           # 1024 + 476
+        data = b"A" * (config.CHUNK_SIZE + 476)  # 1 full chunk + 476 byte remainder
         chunks = split_file_into_chunks(data, client_id=2)
         assert len(chunks) == 2
         assert len(chunks[1].payload) == 476
