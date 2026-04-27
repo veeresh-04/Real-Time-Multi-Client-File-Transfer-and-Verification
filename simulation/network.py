@@ -77,3 +77,36 @@ def maybe_corrupt(chunk: Chunk) -> Chunk:
             )
 
     return chunk
+
+
+def maybe_reorder(chunks: list) -> list:
+    """Randomly swap adjacent chunks to simulate out-of-order delivery.
+
+    In a real network, packets can arrive out of order due to routing.
+    This function simulates that by swapping random adjacent pairs before
+    the server sends them. The client reassembles by seq_num so order
+    of arrival does not matter — this tests that guarantee directly.
+
+    Args:
+        chunks: Ordered list of Chunk objects to potentially reorder.
+
+    Returns:
+        The same list with some adjacent pairs swapped.
+    """
+    if not config.SIMULATE_ERRORS:
+        return chunks
+
+    reorder_probability = getattr(config, "REORDER_PROBABILITY", 0.05)
+    chunks = list(chunks)   # copy — never mutate the original
+
+    for i in range(len(chunks) - 1):
+        if random.random() < reorder_probability:
+            chunks[i], chunks[i + 1] = chunks[i + 1], chunks[i]
+            logger.debug(
+                "SIMULATION — swapped chunks %d and %d for client %d",
+                chunks[i].seq_num,
+                chunks[i + 1].seq_num,
+                chunks[i].client_id,
+            )
+
+    return chunks

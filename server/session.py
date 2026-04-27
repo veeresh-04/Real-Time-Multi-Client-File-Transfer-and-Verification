@@ -34,7 +34,7 @@ import config
 from core import checksum
 from core.errors import ClientDisconnectedError, MaxRetriesExceededError, ProtocolError
 from core.protocol import AckMessage, Chunk, NackMessage, Opcode, split_file_into_chunks
-from simulation.network import maybe_corrupt, maybe_drop
+from simulation.network import maybe_corrupt, maybe_drop, maybe_reorder
 
 logger = logging.getLogger(__name__)
 
@@ -123,11 +123,11 @@ class ClientSession:
     async def _deliver_all_chunks(self, chunks: list[Chunk]) -> None:
         """Send every chunk in order, retrying on NACK or timeout.
 
-        Key design guarantee:
-            The server does not advance to chunk N+1 until it receives
-            an ACK with seq_num == N.  If it receives a NACK or a timeout
-            it retransmits chunk N (always the clean original).
+        Reordering is applied to the full chunk list before delivery begins
+        so the client receives chunks in a scrambled sequence and must
+        reassemble by seq_num — exactly as required by the spec.
         """
+        chunks = maybe_reorder(chunks)
         for chunk in chunks:
             await self._deliver_one_chunk(chunk)
 

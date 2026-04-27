@@ -395,3 +395,65 @@ class TestPerformance:
             )
         finally:
             await _stop_server(task)
+
+
+# ---------------------------------------------------------------------------
+# 7. Out-of-order packet delivery
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestOutOfOrderDelivery:
+    """Chunks arrive in scrambled order — client must reassemble correctly."""
+
+    PORT = _BASE_PORT + 6
+
+    async def test_single_client_with_reordering(self, tmp_path):
+        orig_simulate = config.SIMULATE_ERRORS
+        orig_reorder  = getattr(config, "REORDER_PROBABILITY", 0.05)
+        orig_drop     = config.DROP_PROBABILITY
+        orig_corrupt  = config.CORRUPT_PROBABILITY
+
+        config.SIMULATE_ERRORS     = True
+        config.REORDER_PROBABILITY = 0.3    # aggressively reorder 30% of adjacent pairs
+        config.DROP_PROBABILITY    = 0.0
+        config.CORRUPT_PROBABILITY = 0.0
+
+        _, task = await _start_server(self.PORT)
+        try:
+            # Use a multi-chunk file so reordering is meaningful
+            f = _tmp_file(tmp_path, "reorder.bin", os.urandom(1024 * 1024))
+            result = await _run(1, f)
+            assert result is True, "Transfer failed with out-of-order chunks"
+        finally:
+            await _stop_server(task)
+            config.SIMULATE_ERRORS     = orig_simulate
+            config.REORDER_PROBABILITY = orig_reorder
+            config.DROP_PROBABILITY    = orig_drop
+            config.CORRUPT_PROBABILITY = orig_corrupt
+
+    async def test_five_clients_with_reordering(self, tmp_path):
+        orig_simulate = config.SIMULATE_ERRORS
+        orig_reorder  = getattr(config, "REORDER_PROBABILITY", 0.05)
+        orig_drop     = config.DROP_PROBABILITY
+        orig_corrupt  = config.CORRUPT_PROBABILITY
+
+        config.SIMULATE_ERRORS     = True
+        config.REORDER_PROBABILITY = 0.2
+        config.DROP_PROBABILITY    = 0.0
+        config.CORRUPT_PROBABILITY = 0.0
+
+        _, task = await _start_server(self.PORT)
+        try:
+            files = [
+                _tmp_file(tmp_path, f"reorder_{i}.bin", os.urandom(512 * 1024))
+                for i in range(5)
+            ]
+            results = await _run_all(*enumerate(files, start=1))
+            failed = [i + 1 for i, r in enumerate(results) if not r]
+            assert not failed, f"Clients {failed} failed with out-of-order chunks"
+        finally:
+            await _stop_server(task)
+            config.SIMULATE_ERRORS     = orig_simulate
+            config.REORDER_PROBABILITY = orig_reorder
+            config.DROP_PROBABILITY    = orig_drop
+            config.CORRUPT_PROBABILITY = orig_corrupt

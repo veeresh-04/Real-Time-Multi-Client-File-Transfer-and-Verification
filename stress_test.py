@@ -22,8 +22,8 @@ logging.basicConfig(
 from server.server import FileTransferServer
 from client.client import FileTransferClient
 
-NUM_CLIENTS = 50          # ← change this to test more
-FILE_SIZE_KB = 500        # ← change this to test larger files
+NUM_CLIENTS = 100          # ← change this to test more
+FILE_SIZE_KB = 1024      # ← change this to test larger files
 
 async def main():
     # Create temp files
