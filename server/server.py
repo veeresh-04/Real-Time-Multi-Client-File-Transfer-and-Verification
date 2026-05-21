@@ -50,6 +50,7 @@ class FileTransferServer:
             host=config.HOST,
             port=config.PORT,
             backlog=config.BACKLOG,
+            limit=config.STREAM_READER_LIMIT,  # raised from 64KB default to support large uploads
         )
 
         addr = self._server.sockets[0].getsockname()

@@ -26,6 +26,17 @@ CHUNK_SIZE: int    = 65536          # 64 KB -- fast for large files, fine for sm
 HEADER_FORMAT: str = "!I I I ? I"  # client_id, seq_num, total_chunks, is_last, crc32
 HEADER_SIZE: int   = 17            # struct.calcsize(HEADER_FORMAT)
 
+# asyncio.StreamReader internal buffer limit.
+# Default is 65536 (64 KB) — fine for small files but causes backpressure
+# and connection resets when clients upload large files (300 MB+) in one write.
+# Set to 256 MB to comfortably handle any realistic file size.
+STREAM_READER_LIMIT: int = 256 * 1024 * 1024   # 256 MB
+
+# How many bytes to stream per write call during upload.
+# Sending 300 MB in one writer.write() call allocates 300 MB in the send buffer.
+# Streaming in 4 MB chunks keeps memory usage flat regardless of file size.
+UPLOAD_CHUNK_SIZE: int = 4 * 1024 * 1024        # 4 MB per upload write call
+
 # --- Reliability ---
 # MAX_RETRIES must survive the worst-case consecutive-drop streak.
 # With 5% drop rate: P(10 consecutive drops) is negligible for any file size.

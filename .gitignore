@@ -34,3 +34,6 @@ server_storage/
 *.tmp
 *.temp
 stress_tmp/
+
+#local data
+/data

@@ -126,18 +126,26 @@ class FileTransferClient:
         return data
 
     async def _upload(self, file_data: bytes) -> None:
-        """Send UPLOAD_REQUEST.
+        """Send UPLOAD_REQUEST, streaming the payload in chunks.
+
+        Sending all data in one writer.write() call allocates the full file
+        in the asyncio send buffer and overwhelms the server's StreamReader
+        (default 64 KB limit), causing connection resets on large files
+        (100 MB+).  Streaming in UPLOAD_CHUNK_SIZE pieces keeps memory flat
+        and respects server flow control.
 
         Wire format:
             1B  Opcode.UPLOAD_REQUEST
             4B  file size (uint32, network order)
-            NB  raw file bytes
+            NB  raw file bytes  (streamed in UPLOAD_CHUNK_SIZE pieces)
         """
-        await self._write(
-            Opcode.UPLOAD_REQUEST
-            + struct.pack("!I", len(file_data))
-            + file_data
-        )
+        size_header = struct.pack("!I", len(file_data))
+        await self._write(Opcode.UPLOAD_REQUEST + size_header)
+
+        upload_chunk = config.UPLOAD_CHUNK_SIZE
+        for offset in range(0, max(len(file_data), 1), upload_chunk):
+            await self._write(file_data[offset : offset + upload_chunk])
+
         logger.info(
             "Client %d — upload sent (%d bytes).", self.client_id, len(file_data)
         )
